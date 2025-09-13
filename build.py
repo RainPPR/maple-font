@@ -19,6 +19,7 @@ from source.py.utils import (
     adjust_line_height,
     check_font_patcher,
     check_directory_hash,
+    patch_instance,
     verify_glyph_width,
     archive_fonts,
     download_cn_base_font,
@@ -30,6 +31,7 @@ from source.py.utils import (
     set_font_name,
     joinPaths,
     merge_ttfonts,
+    default_weight_map,
 )
 from source.py.freeze import freeze_feature, get_freeze_config_str, is_enable
 from source.py.feature import (
@@ -39,7 +41,7 @@ from source.py.feature import (
 )
 
 
-FONT_VERSION = "v7.6"
+FONT_VERSION = "v7.7"
 # =========================================================================================
 
 
@@ -306,11 +308,12 @@ class FontConfig:
         # whether to use hinted ttf as base font
         self.use_hinted = True
         # whether to enable ligature
-        self.enable_liga = True
+        self.enable_ligature = True
         # whether to enable infinite arrow ligatures in hinted font
         self.infinite_arrow = None
         # whether to remove plain text ligatures like `[TODO]`
         self.remove_tag_liga = False
+        self.weight_mapping = default_weight_map
         self.feature_freeze = {
             "cv01": "ignore",
             "cv02": "ignore",
@@ -385,7 +388,8 @@ class FontConfig:
         self.glyph_width_cn_narrow = 1000
         self.use_normal_preset = False
         self.ttfautohint_param = {}
-        self.line_height_factor = 1.0
+        self.line_height = 1.0
+        self.vertical_metric: tuple[int, int] = (1020, -300)
 
         self.__load_config()
         self.__load_args(args)
@@ -413,11 +417,13 @@ class FontConfig:
                     "family_name",
                     "pool_size",
                     "use_hinted",
-                    "enable_liga",
+                    "enable_ligature",
                     "ttfautohint_param",
                     "infinite_arrow",
                     "line_height",
                     "github_mirror",
+                    "weight_mapping",
+                    "remove_tag_ligature",
                     "feature_freeze",
                     "nerd_font",
                     "cn",
@@ -432,7 +438,7 @@ class FontConfig:
                             else {**getattr(self, prop), **val},
                         )
                 if "ligature" in data and data["ligature"] is not None:
-                    self.enable_liga = data["ligature"]
+                    self.enable_ligature = data["ligature"]
 
         except FileNotFoundError:
             print(f"🚨 Config file not found: {config_file_path}, use default config")
@@ -465,7 +471,7 @@ class FontConfig:
             self.use_hinted = args.hinted
 
         if args.liga is not None:
-            self.enable_liga = args.liga
+            self.enable_ligature = args.liga
 
         if self.debug:
             self.nerd_font["enable"] = False
@@ -479,7 +485,7 @@ class FontConfig:
             self.remove_tag_liga = True
 
         if args.line_height is not None:
-            self.line_height_factor = args.line_height
+            self.line_height = args.line_height
 
         if args.nf_mono:
             self.nerd_font["mono"] = args.nf_mono
@@ -520,7 +526,7 @@ class FontConfig:
         name_arr = [word.capitalize() for word in self.family_name.split(" ")]
         if self.use_normal_preset:
             name_arr.append("Normal")
-        if not self.enable_liga:
+        if not self.enable_ligature:
             name_arr.append("NL")
         if self.debug:
             name_arr.append("Debug")
@@ -528,7 +534,7 @@ class FontConfig:
         self.family_name_compact = "".join(name_arr)
 
         self.freeze_config_str = get_freeze_config_str(
-            self.feature_freeze, self.enable_liga
+            self.feature_freeze, self.enable_ligature
         )
 
     def should_build_nf_cn(self) -> bool:
@@ -611,7 +617,7 @@ class FontConfig:
             is_italic=is_italic,
             is_cn=is_cn,
             is_normal=self.use_normal_preset,
-            is_calt=self.enable_liga,
+            is_calt=self.enable_ligature,
             enable_infinite=enable_infinite,
             enable_tag=not self.remove_tag_liga,
             variable_enabled_feature_list=[
@@ -625,7 +631,7 @@ class FontConfig:
         except Exception as e:
             issue_fea_path = joinPaths(issue_fea_dir, "issue.fea")
             with open(issue_fea_path, "w+") as f:
-                banner = f"Generated feature with italic={is_italic}, cn={is_cn}, normal={self.use_normal_preset}, calt={self.enable_liga}, variable={is_variable}"
+                banner = f"Generated feature with italic={is_italic}, cn={is_cn}, normal={self.use_normal_preset}, calt={self.enable_ligature}, variable={is_variable}"
                 f.write(f"# {banner}\n\n{fea_str}")
             raise SyntaxError(
                 f"Error patching fea string: {e}\n\nSee generated fea string in {issue_fea_path}"
@@ -1113,11 +1119,9 @@ def build_mono(f: str, font_config: FontConfig, build_option: BuildOption):
 
     handle_ligatures(
         font=font,
-        enable_ligature=font_config.enable_liga,
+        enable_ligature=font_config.enable_ligature,
         freeze_config=font_config.feature_freeze,
     )
-
-    adjust_line_height(font, font_config.line_height_factor)
 
     verify_glyph_width(
         font=font,
@@ -1301,7 +1305,10 @@ def build_nf(
         preferred_style_name=style_in_17,
     )
 
-    adjust_line_height(nf_font, font_config.line_height_factor)
+    if font_config.line_height != 1:
+        adjust_line_height(
+            nf_font, font_config.line_height, font_config.vertical_metric
+        )
 
     if not (
         build_option.should_use_font_patcher(font_config)
@@ -1380,7 +1387,7 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
 
     handle_ligatures(
         font=cn_font,
-        enable_ligature=font_config.enable_liga,
+        enable_ligature=font_config.enable_ligature,
         freeze_config=font_config.feature_freeze,
     )
 
@@ -1435,7 +1442,7 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
         }
         cn_font["meta"] = meta
 
-    adjust_line_height(cn_font, font_config.line_height_factor)
+    adjust_line_height(cn_font, font_config.line_height, font_config.vertical_metric)
 
     if not (
         font_config.should_build_nf_cn()
@@ -1614,6 +1621,15 @@ def main(args: list[str] | None = None, version: str | None = None):
             if is_italic:
                 add_ital_axis_to_stat(font)
 
+            patch_instance(font, font_config.weight_mapping)
+
+            if font_config.line_height != 1:
+                calculated_metric = (font["hhea"].ascender, font["hhea"].descender)  # type: ignore
+                if calculated_metric != font_config.vertical_metric:
+                    font_config.vertical_metric = calculated_metric
+
+                adjust_line_height(font, font_config.line_height, calculated_metric)
+
             verify_glyph_width(
                 font=font,
                 expect_widths=font_config.get_valid_glyph_width_list(),
@@ -1739,8 +1755,10 @@ def main(args: list[str] | None = None, version: str | None = None):
         result = {
             "version": FONT_VERSION,
             "family_name": font_config.family_name,
+            "weight_mapping": font_config.weight_mapping,
+            "line_height": font_config.line_height,
             "use_hinted": font_config.use_hinted,
-            "ligature": font_config.enable_liga,
+            "ligature": font_config.enable_ligature,
             "feature_freeze": font_config.feature_freeze,
             "nerd_font": font_config.nerd_font,
             "cn": font_config.cn,
