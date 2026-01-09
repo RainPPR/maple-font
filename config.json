@@ -17,7 +17,8 @@
     "bold": 700,
     "extrabold": 800
   },
-  "line_height": 1,
+  "line_height": 1.0,
+  "width": "default",
   "feature_freeze": {
     "cv01": "enable",
     "cv02": "enable",
@@ -49,9 +50,10 @@
     "cv63": "ignore",
     "cv64": "ignore",
     "cv65": "ignore",
-    "cv96": "enable",
-    "cv97": "enable",
-    "cv98": "enable",
+    "cv66": "ignore",
+    "cv96": "ignore",
+    "cv97": "ignore",
+    "cv98": "ignore",
     "cv99": "ignore",
     "ss01": "ignore",
     "ss02": "ignore",

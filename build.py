@@ -13,14 +13,16 @@ from typing import Callable, Literal
 from fontTools.ttLib import TTFont, newTable
 from fontTools.feaLib.builder import addOpenTypeFeatures, addOpenTypeFeaturesFromString
 from ttfautohint import StemWidthMode, ttfautohint
+from source.py.transform import change_glyph_width_or_scale, smart_change_width
 from source.py.utils import (
     add_gasp,
     add_ital_axis_to_stat,
     adjust_line_height,
-    change_glyph_width_or_scale,
     check_font_patcher,
     check_directory_hash,
+    parse_style_name,
     patch_instance,
+    update_font_names,
     verify_glyph_width,
     archive_fonts,
     download_cn_base_font,
@@ -28,10 +30,10 @@ from source.py.utils import (
     is_ci,
     match_unicode_names,
     run,
-    set_font_name,
     joinPaths,
     merge_ttfonts,
     default_weight_map,
+    remove_target_glyph,
 )
 from source.py.freeze import freeze_feature, get_freeze_config_str, is_enable
 from source.py.feature import (
@@ -41,7 +43,7 @@ from source.py.feature import (
 )
 
 
-FONT_VERSION = "v7.7"
+FONT_VERSION = "v7.9"
 # =========================================================================================
 
 
@@ -73,6 +75,12 @@ def check_ftcli():
 
 
 # =========================================================================================
+
+WIDTH_MAP = {
+    "default": 600,
+    "narrow": 550,
+    "slim": 500,
+}
 
 
 def parse_scale_factor(value) -> tuple[float, float]:
@@ -191,6 +199,13 @@ def parse_args(args: list[str] | None = None):
         "--line-height",
         type=float,
         help="Scale factor for line height (e.g. 1.1)",
+    )
+    feature_group.add_argument(
+        "--width",
+        type=str,
+        choices=WIDTH_MAP.keys(),
+        default="default",
+        help="Set glyph width: default (600), narrow (550), slim (500)",
     )
     feature_group.add_argument(
         "--nf-mono",
@@ -314,6 +329,7 @@ class FontConfig:
         # whether to remove plain text ligatures like `[TODO]`
         self.remove_tag_liga = False
         self.weight_mapping = default_weight_map
+        self.width = "default"
         self.feature_freeze = {
             "cv01": "ignore",
             "cv02": "ignore",
@@ -421,9 +437,10 @@ class FontConfig:
                     "ttfautohint_param",
                     "infinite_arrow",
                     "line_height",
+                    "width",
                     "github_mirror",
                     "weight_mapping",
-                    "remove_tag_ligature",
+                    "remove_tag_liga",
                     "feature_freeze",
                     "nerd_font",
                     "cn",
@@ -472,6 +489,9 @@ class FontConfig:
 
         if args.remove_tag_liga:
             self.remove_tag_liga = True
+
+        if args.width:
+            self.width = args.width
 
         if args.line_height is not None:
             self.line_height = args.line_height
@@ -532,12 +552,20 @@ class FontConfig:
     def _update_family_names(self):
         """Update family names based on options."""
         name_arr = [word.capitalize() for word in self.family_name.split(" ")]
+
         if self.use_normal_preset:
             name_arr.append("Normal")
+
         if not self.enable_ligature:
             name_arr.append("NL")
+
+        width_name = self.get_width_name()
+        if width_name:
+            name_arr.append(width_name)
+
         if self.debug:
             name_arr.append("Debug")
+
         self.family_name = " ".join(name_arr)
         self.family_name_compact = "".join(name_arr)
 
@@ -551,6 +579,15 @@ class FontConfig:
         self.freeze_config_str = get_freeze_config_str(
             self.feature_freeze, self.enable_ligature
         )
+
+    def get_target_width(self) -> int:
+        return WIDTH_MAP.get(self.width, WIDTH_MAP["default"])
+
+    def get_width_name(self) -> str | None:
+        if self.width == "narrow":
+            return "NR"
+        elif self.width == "slim":
+            return "SL"
 
     def should_build_nf_cn(self) -> bool:
         return self.cn["with_nerd_font"] and self.nerd_font["enable"]
@@ -576,21 +613,23 @@ class FontConfig:
         return True
 
     def get_valid_glyph_width_list(self, cn=False):
-        if cn:
-            cn = (
-                self.glyph_width_cn_narrow
-                if self.cn["narrow"]
-                else 2 * self.glyph_width
-            )
-            return [
-                0,
-                self.glyph_width,
-                cn,
-            ]
+        result = [0]
+        if self.get_width_name():
+            w = self.get_target_width()
+            result.append(w)
+            if cn:
+                result.append(w * 2)
         else:
-            return [0, self.glyph_width]
+            result.append(self.glyph_width)
+            if cn:
+                result.append(
+                    self.glyph_width_cn_narrow
+                    if self.cn["narrow"]
+                    else 2 * self.glyph_width
+                )
+        return result
 
-    def patch_fea_string(
+    def patch_font_feature(
         self,
         font: TTFont,
         issue_fea_dir: str,
@@ -607,6 +646,7 @@ class FontConfig:
                     font,
                     fea_path,
                 )
+            self.freeze_feature_static(font, is_variable)
             return
 
         # If is hinted and keep inf liga, skip patching feature
@@ -640,6 +680,7 @@ class FontConfig:
             ]
             if is_variable
             else [],
+            remove_italic_calt=is_enable(self.feature_freeze["cv35"]),
         )
         try:
             addOpenTypeFeaturesFromString(font, fea_str)
@@ -651,6 +692,16 @@ class FontConfig:
             raise SyntaxError(
                 f"Error patching fea string: {e}\n\nSee generated fea string in {issue_fea_path}"
             ) from e
+        self.freeze_feature_static(font, is_variable)
+
+    def freeze_feature_static(self, font: TTFont, is_variable: bool):
+        if not is_variable:
+            freeze_feature(
+                font=font,
+                calt=self.enable_ligature,
+                moving_rules=get_freeze_moving_rules(),
+                config=self.feature_freeze,
+            )
 
 
 class BuildOption:
@@ -675,21 +726,6 @@ class BuildOption:
         self.cn_suffix_compact = None
         self.cn_base_font_dir = ""
         self.output_cn = ""
-        # In these subfamilies:
-        #   - NameID1 should be the family name
-        #   - NameID2 should be the subfamily name
-        #   - NameID16 and NameID17 should be removed
-        # Other subfamilies:
-        #   - NameID1 should be the family name, append with subfamily name without "Italic"
-        #   - NameID2 should be the "Regular" or "Italic"
-        #   - NameID16 should be the family name
-        #   - NameID17 should be the subfamily name
-        # https://github.com/subframe7536/maple-font/issues/182
-        # https://github.com/subframe7536/maple-font/issues/183
-        #
-        # same as `ftcli assistant commit . --ls 400 700`
-        # https://github.com/ftCLI/FoundryTools-CLI/issues/166#issuecomment-2095756721
-        self.base_subfamily_list = ["Regular", "Bold", "Italic", "BoldItalic"]
         self.is_nf_built = False
         self.is_cn_built = False
         self.has_cache = (
@@ -862,21 +898,6 @@ class BuildOption:
         )
 
 
-def handle_ligatures(
-    font: TTFont, enable_ligature: bool, freeze_config: dict[str, str]
-):
-    """
-    whether to enable ligatures and freeze font features
-    """
-
-    freeze_feature(
-        font=font,
-        calt=enable_ligature,
-        moving_rules=get_freeze_moving_rules(),
-        config=freeze_config,
-    )
-
-
 # def instantiate_cn_var(f: TTFont, base_dir: str, output_dir: str):
 #     run(
 #         f"ftcli converter var2static -out {output_dir} {joinPaths(base_dir, f)}",
@@ -891,25 +912,6 @@ def handle_ligatures(
 #     run(
 #         f"ftcli font del-table -t kern -t GPOS {font_path}",
 #     )
-
-
-def parse_style_name(style_name_compact: str, skip_subfamily_list: list[str]):
-    is_italic = style_name_compact.endswith("Italic")
-
-    _style_name = style_name_compact
-    if is_italic and style_name_compact[0] != "I":
-        _style_name = style_name_compact[:-6] + " Italic"
-
-    if style_name_compact in skip_subfamily_list:
-        return "", _style_name, _style_name, True, is_italic
-    else:
-        return (
-            " " + style_name_compact.replace("Italic", ""),
-            "Italic" if is_italic else "Regular",
-            _style_name,
-            False,
-            is_italic,
-        )
 
 
 # def fix_cn_cv(font: TTFont):
@@ -972,6 +974,8 @@ def rename_glyph_name(
             "tag_uni061C.liga": "tag_mark.liga",
             "tag_u1F5C8.liga": "tag_note.liga",
             "tag_uni26A0.liga": "tag_warning.liga",
+            "uni266F_start.bg": "sharp_start.bg",
+            "uni266F_end.bg": "sharp_end.bg",
         },
     }
 
@@ -1017,36 +1021,6 @@ def get_unique_identifier(
     return f"{font_config.version_str}{beta_str};SUBF;{postscript_name};2024;FL830;{suffix}"
 
 
-def update_font_names(
-    font: TTFont,
-    family_name: str,  # NameID 1
-    style_name: str,  # NameID 2
-    unique_identifier: str,  # NameID 3
-    full_name: str,  # NameID 4
-    version_str: str,  # NameID 5
-    postscript_name: str,  # NameID 6
-    is_skip_subfamily: bool,
-    preferred_family_name: str | None = None,  # NameID 16
-    preferred_style_name: str | None = None,  # NameID 17
-):
-    # Reported in #598
-    # Why: https://github.com/ryanoasis/nerd-fonts/discussions/891#discussioncomment-3471991
-    if len(family_name) > 31:
-        print(
-            f"⚠️ The family name [{family_name}] is too long (> 31) for some old Windows softwares"
-        )
-    set_font_name(font, family_name, 1)
-    set_font_name(font, style_name, 2)
-    set_font_name(font, unique_identifier, 3)
-    set_font_name(font, full_name, 4)
-    set_font_name(font, version_str, 5)
-    set_font_name(font, postscript_name, 6)
-
-    if not is_skip_subfamily and preferred_family_name and preferred_style_name:
-        set_font_name(font, preferred_family_name, 16)
-        set_font_name(font, preferred_style_name, 17)
-
-
 def build_mono(f: str, font_config: FontConfig, build_option: BuildOption):
     print(f"👉 Minimal version for {f}")
     source_path = joinPaths(build_option.output_ttf, f)
@@ -1065,7 +1039,6 @@ def build_mono(f: str, font_config: FontConfig, build_option: BuildOption):
     style_with_prefix_space, style_in_2, style_in_17, is_skip_subfamily, is_italic = (
         parse_style_name(
             style_name_compact=style_compact,
-            skip_subfamily_list=build_option.base_subfamily_list,
         )
     )
 
@@ -1093,7 +1066,7 @@ def build_mono(f: str, font_config: FontConfig, build_option: BuildOption):
     elif style_with_prefix_space == " ExtraLight":
         font["OS/2"].usWeightClass = 275  # type: ignore
 
-    font_config.patch_fea_string(
+    font_config.patch_font_feature(
         font=font,
         issue_fea_dir=build_option.output_dir,
         is_italic=is_italic,
@@ -1101,12 +1074,6 @@ def build_mono(f: str, font_config: FontConfig, build_option: BuildOption):
         is_variable=False,
         is_hinted=False,
         fea_path=build_option.get_feature_file_path(is_italic),
-    )
-
-    handle_ligatures(
-        font=font,
-        enable_ligature=font_config.enable_ligature,
-        freeze_config=font_config.feature_freeze,
     )
 
     verify_glyph_width(
@@ -1148,7 +1115,7 @@ def build_mono_autohint(f: str, font_config: FontConfig, build_option: BuildOpti
     source_path = joinPaths(build_option.output_ttf, f)
     font = TTFont(source_path)
     is_italic = "Italic" in style_compact
-    font_config.patch_fea_string(
+    font_config.patch_font_feature(
         font=font,
         issue_fea_dir=build_option.output_dir,
         is_italic=is_italic,
@@ -1157,6 +1124,7 @@ def build_mono_autohint(f: str, font_config: FontConfig, build_option: BuildOpti
         is_hinted=True,
         fea_path=build_option.get_feature_file_path(is_italic),
     )
+
     param: dict | None = font_config.ttfautohint_param
 
     buf = BytesIO()
@@ -1209,10 +1177,20 @@ def build_nf_by_prebuild_nerd_font(
     suffix = font_config.get_nf_suffix()
     if suffix:
         suffix = "-" + suffix
-    return merge_ttfonts(
+    result = merge_ttfonts(
         base_font_path=joinPaths(build_option.ttf_base_dir, font_basename),
         extra_font_path=f"{build_option.src_dir}/MapleMono-NF-Base{suffix}.ttf",
     )
+
+    if font_config.get_width_name():
+        smart_change_width(
+            font=result,
+            target_width=font_config.get_target_width(),
+            original_ref_width=font_config.glyph_width,
+            also_scale_y=True,
+        )
+
+    return result
 
 
 def build_nf_by_font_patcher(
@@ -1270,7 +1248,6 @@ def build_nf(
     style_nf_with_prefix_space, style_in_2, style_in_17, is_skip_sufamily, _ = (
         parse_style_name(
             style_name_compact=style_compact_nf,
-            skip_subfamily_list=build_option.base_subfamily_list,
         )
     )
 
@@ -1329,6 +1306,8 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
         use_pyftmerge=True,
     )
 
+    remove_target_glyph(cn_font, ".1")
+
     (
         style_cn_with_prefix_space,
         style_in_2,
@@ -1337,7 +1316,6 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
         is_italic,
     ) = parse_style_name(
         style_name_compact=style_compact_cn,
-        skip_subfamily_list=build_option.base_subfamily_list,
     )
 
     postscript_name = f"{font_config.family_name_compact}-{build_option.cn_suffix_compact}-{style_compact_cn}"
@@ -1365,7 +1343,7 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
     # https://github.com/subframe7536/maple-font/issues/313
     # fix_cn_cv(cn_font)
 
-    font_config.patch_fea_string(
+    font_config.patch_font_feature(
         font=cn_font,
         issue_fea_dir=build_option.output_dir,
         is_italic=is_italic,
@@ -1373,12 +1351,6 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
         is_variable=False,
         is_hinted=font_config.use_hinted,
         fea_path=build_option.get_feature_file_path(is_italic, True),
-    )
-
-    handle_ligatures(
-        font=cn_font,
-        enable_ligature=font_config.enable_ligature,
-        freeze_config=font_config.feature_freeze,
     )
 
     target_width = (
@@ -1400,7 +1372,9 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
             cn_font["OS/2"].panose.bProportion = 0  # type: ignore
             cn_font["OS/2"].panose.bSpacing = 0  # type: ignore
             cn_font["hhea"].advanceWidthMax = target_width  # type: ignore
-            print("Changed CN glyph width, mark font file as not monospaced")
+            print(
+                "Changed CN glyph width, mark font file as not monospaced and skip checking glyph width"
+            )
         else:
             target_width = match_width
 
@@ -1414,7 +1388,15 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
             match_width=match_width,
             target_width=target_width,
             scale_factor=scale_factor,
-            skip_name=["ellipsis.full"],
+            special_names=["ellipsis.full"],
+        )
+    elif font_config.get_width_name():
+        change_glyph_width_or_scale(
+            font=cn_font,
+            match_width=2 * font_config.glyph_width,
+            target_width=2 * font_config.get_target_width(),
+            scale_factor=(1.0, 1.0),
+            special_names=["ellipsis.full"],
         )
 
     # https://github.com/subframe7536/maple-font/issues/239
@@ -1436,11 +1418,14 @@ def build_cn(f: str, font_config: FontConfig, build_option: BuildOption):
     adjust_line_height(cn_font, font_config.line_height, font_config.vertical_metric)
 
     if not (
-        font_config.should_build_nf_cn()
-        and (
-            build_option.should_use_font_patcher(font_config)
-            or font_config.get_nf_suffix() == "Propo"
+        (
+            font_config.should_build_nf_cn()
+            and (
+                build_option.should_use_font_patcher(font_config)
+                or font_config.get_nf_suffix() == "Propo"
+            )
         )
+        or target_width
     ):
         verify_glyph_width(
             font=cn_font,
@@ -1510,9 +1495,16 @@ def build_variable_fonts(font_config: FontConfig, build_option: BuildOption):
             ),
         )
 
+        if font_config.get_width_name():
+            smart_change_width(
+                font=font,
+                target_width=font_config.get_target_width(),
+                original_ref_width=font_config.glyph_width,
+            )
+
         is_italic = "Italic" in input_file
 
-        font_config.patch_fea_string(
+        font_config.patch_font_feature(
             font=font,
             issue_fea_dir=build_option.output_dir,
             is_italic=is_italic,
@@ -1568,10 +1560,13 @@ def build_variable_fonts(font_config: FontConfig, build_option: BuildOption):
     print("\n✨ Instatiate and optimize fonts...\n")
 
     print("Check and optimize variable fonts")
-    run(f"ftcli fix italic-angle {build_option.output_variable}")
+
+    # Italic angle is correct here.
+    # run(f"ftcli fix italic-angle {build_option.output_variable}")
+
     run(f"ftcli fix monospace {build_option.output_variable}")
     # run(f"ftcli fix vertical-metrics {build_option.output_variable}")
-    run(f"ftcli name del-mac-names -r {build_option.output_variable}")
+    # run(f"ftcli name del-mac-names -r {build_option.output_variable}")
 
     print("Instantiate TTF")
     run(
@@ -1697,9 +1692,7 @@ def main(args: list[str] | None = None, version: str | None = None):
 
     should_use_cache = parsed_args.cache
     target_styles = (
-        build_option.base_subfamily_list
-        if parsed_args.least_styles or font_config.debug
-        else None
+        ["Regular", "Italic"] if parsed_args.least_styles or font_config.debug else None
     )
 
     if not should_use_cache:
@@ -1733,10 +1726,15 @@ def main(args: list[str] | None = None, version: str | None = None):
         result = {
             "version": FONT_VERSION,
             "family_name": font_config.family_name,
-            "weight_mapping": font_config.weight_mapping,
             "line_height": font_config.line_height,
+            "width": font_config.width,
             "use_hinted": font_config.use_hinted,
             "ligature": font_config.enable_ligature,
+            "remove_tag_liga": font_config.remove_tag_liga,
+            "infinite_arrow": "default"
+            if font_config.infinite_arrow is None
+            else font_config.infinite_arrow,
+            "weight_mapping": font_config.weight_mapping,
             "feature_freeze": font_config.feature_freeze,
             "nerd_font": font_config.nerd_font,
             "cn": font_config.cn,
