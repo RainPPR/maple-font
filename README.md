@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> This branch has been frozen as a snapshot of V7. V8 will include the latest features and bug fixes. see it in [`variable` branch](https://github.com/subframe7536/maple-font/tree/variable).
+
 ![Cover](./resources/header.png)
 
 <p align="center">
@@ -58,7 +61,7 @@ CN version based on [Resource Han Rounded](https://github.com/CyanoHao/Resource-
 
 ## Download
 
-You can download all the font archives from [Releases](https://github.com/subframe7536/maple-font/releases).
+You can download all the font archives from [Releases](https://github.com/subframe7536/maple-font/releases/tag/v7.9).
 
 ### Scoop (Windows)
 
